@@ -1,0 +1,284 @@
+---
+title: "Práctica Big Data con Mongo DB y R"
+author: "Jorge Colomer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    theme: yeti
+    code_download: no
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	eval = TRUE,
+	echo = TRUE,
+	error = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	options(scipen=999)
+)
+```
+
+Cargamos los paquetes que vamos a usar.
+
+```{r librerías}
+library(tidyverse) # manipulación de data frames
+library(mongolite) # para interactuar con MongoDB
+library(ggeasy) # facilita la personalización de objetos ggplot
+library(gt) # para generar tablas formateadas en el informe html
+```
+
+# Tarea 1
+
+*Exploremos otro diagrama de barras con una colección diferente - `inspections`. Esta recopilación contiene datos sobre las inspecciones de edificios de la ciudad de Nueva York y si pasan o no. Recupere dicha colección en R.*
+
+Primeramente, procederemos a establecer la cadena y opciones de conexión a la base de datos en MongoDB.
+
+```{r conexión a la db}
+cadena_conexion <- "mongodb+srv://user01:user01@cluster0.mcblc3z.mongodb.net/test"
+opciones_conexion <- ssl_options(weak_cert_validation = FALSE)
+```
+
+Conectamos a MongoDB y recuperamos la colección `inspections` dentro de `sample_training`.
+
+```{r acceso a la db inspections}
+inspections <- mongo(
+  collection = "inspections", 
+  db = "sample_training", 
+  url = cadena_conexion, 
+  options = opciones_conexion
+  )
+```
+
+# Tarea 2
+
+*Suponga que desea verificar el número de empresas que no aprobaron las inspecciones en 2015 en comparación con 2016.*
+
+*Si ve los datos obtenidos de la colección, notará que el campo de fecha es una Cadena. Convertirlo en tipo de fecha y luego extraer el año requerirá algún procesamiento. Pero, con la canalización de agregación de Mongodb, puede hacer todo en una sola consulta. Para manipular el campo de fecha, use el operador [\$addFields](https://docs.mongodb.com/manual/reference/operator/aggregation/addFields/).*
+
+*Además, agregue las deficiencias encontradas en las inspecciones por año.*
+
+En primer lugar, examinamos la estructura del primer documento para inferir la del resto.
+
+```{r inspección}
+num_docs <- inspections$count() # por si interesara conocer el número de registros
+inspections$iterate()$one()
+```
+
+La colección tiene `r num_docs` registros.
+
+Para conocer más en profundidad la base de datos de trabajo, podemos importar los 3 primeros registros (aunque la base de datos es relativamente pequeña y no habría problemas en cargarla en $R$ en su totalidad) y aplicar la función `dplyr::glimpse`.
+
+```{r}
+inspecciones <- inspections$find(limit = 3) %>% 
+  as_tibble()
+
+glimpse(inspecciones)
+```
+
+Vemos que el campo `address` es en realidad un data frame con 4 variables. Usamos la función `unnest` para "aplanar" esta columna.
+
+```{r}
+inspecciones <- inspecciones %>% 
+  unnest(cols = "address") # para "aplanar" la columna address, ya que contiene un df anidado con 4 campos
+
+glimpse(inspecciones)
+```
+
+Es decir, el campo `result` es el que nos interesa para conocer el tipo y número de inspecciones. Veamos los valores que puede tomar esta variable.
+
+```{r}
+# Encontrar los valores únicos en result
+pipeline01 <- '[ 
+  { "$group": { "_id": "$result" } },
+  { "$sort": { "_id": 1 } }
+]'
+
+inspections$aggregate(pipeline01) %>% 
+  as_tibble() %>% 
+  rename("Type of inspection" = `_id`) %>% 
+  gt()
+```
+
+El número de categorías en la variable `result` es de `r nrow(inspections$aggregate(pipeline01))`.[^1]
+
+[^1]: Podríamos haber obtenido un resultado similar utilizando la función `unique()` de $R$ sobre la columna `result` del data frame completo.
+
+Asumiendo que `Fail` indica que una empresa no aprueba la inspección, veamos el número total de `Fail` en la columna `result`:
+
+```{r}
+inspections$count('{"result": "Fail"}')
+```
+
+Para conocer el número de empresas que no aprobaron las inspecciones en 2015 y 2016 diseñamos la siguiente consulta (desglose por año):
+
+-   `addFields`: Extraemos el año de la cadena `date` utilizando `substr` y lo almacenamos en un nuevo campo llamado `year`. *date* es el nombre del campo que contiene la fecha como una cadena y 7, 4 especifica que queremos extraer 4 caracteres comenzando desde el carácter 7 (considerando que los índices comienzan desde 0).
+
+-   `match`: Filtramos los documentos para considerar sólo aquellos que tienen `result` igual a `Fail`.
+
+-   `group`: Agrupamos los documentos por año y contamos el número de documentos en cada grupo utilizando `sum`.
+
+-   `match`: Filtramos los resultados para incluir solo los años 2015 y 2016.
+
+```{r}
+# Definir el pipeline de agregación
+pipeline02 <- '[ 
+  { "$addFields": { "year": { "$substr": [ "$date", 7, 4 ] } } },
+  { "$match": { "result": "Fail" } },
+  { "$group": { "_id": "$year", "count": { "$sum": 1 } } },
+  { "$match": { "_id": { "$in": ["2015", "2016"] } } }
+]'
+
+# Ejecutar la agregación
+fail_year <- inspections$aggregate(pipeline02) %>% 
+  as_tibble() %>% 
+  rename("year" = `_id`,
+         "# fails" = count)
+
+fail_year %>% 
+  gt()
+```
+
+Es decir, hay `r fail_year[1, 2]` fallos en 2015 y `r fail_year[2, 2]` en 2016.
+
+Para agregar las deficiencias encontradas por año, definimos, ejecutamos e imprimimos el siguiente pipeline:
+
+```{r}
+# Definir el pipeline de agregación
+pipeline03 <- '[ 
+  { "$addFields": { "year": { "$substr": [ "$date", 7, 4 ] } } },
+  { "$match": { "year": { "$in": ["2015", "2016"] } } },
+  { "$group": { "_id": { "year": "$year", "result": "$result" }, "count": { "$sum": 1 } } },
+  { "$sort": { "_id.year": 1, "_id.result": 1 } }
+]'
+
+# Ejecutar y mostrar la agregación
+inspections$aggregate(pipeline03) %>% 
+  as_tibble() %>% 
+  unnest(cols = `_id`) %>% # para "aplanar" el df de la columna _id 
+  gt()
+```
+
+# Tarea 3
+
+*Teniendo en cuenta que el resultado de la tarea anterior está agrupando los resultados por año, cree un gráfico de barras.*
+
+Aquí podemos usar el paquete `ggplot` para realizar el gráfico solicitado, utilizando el tema `theme_minimal` y la librería `ggeasy`, la cual facilita la personalización de un objeto `ggplot`.
+
+```{r Tarea 3}
+fail_year %>% 
+ggplot(aes(x = year, 
+           y = `# fails`, 
+           fill = year)
+       ) +
+ geom_col(alpha = 0.7) +
+ theme_minimal() +
+  easy_plot_title_size(size = 18) +
+  easy_plot_subtitle_size(size = 14) +
+ easy_remove_legend() +
+ easy_remove_axes(which = "both", what = "title") +
+ easy_remove_y_axis(what = "text") + 
+ easy_remove_gridlines() +
+ geom_text(aes(label = `# fails`), 
+           color = "black", 
+           vjust = -0.5,
+           size = 3.4
+           ) +
+ easy_x_axis_labels_size(size = 11) +
+ easy_change_text(which = "plot.title", 
+                  what = "face", 
+                  to = "bold"
+                  ) +
+ theme(axis.ticks.length = unit(0.10, "cm"),
+        axis.ticks.x = element_line(colour = "black"),
+        axis.ticks.y = element_blank()
+       ) +
+  easy_labs(title = "Número de fallos por año", 
+            subtitle = "Base de datos: inspections"
+            )
+```
+
+# Tarea 4
+
+*A continuación, se utilizará la colección 'companies', que contiene información sobre empresas, como su año de fundación y la dirección de su sede.*
+
+*Supongamos que desea conocer la tendencia del número de empresas de publicidad (category_code = 'advertising') fundadas a partir de 2000 en adelante. Para ello, utilice el operador relacional [\$gt](https://docs.mongodb.com/manual/reference/operator/query/gt/), agrupe los resultados por año de creación ('founded_year') y ordénelos para que se muestren posterioremente en un gráfico de líneas por año.*
+
+En primer lugar, generemos el puntero a la base de datos y exploremos el primer registro con `dplyr::glimpse`:
+
+```{r Tarea 4}
+companies <- mongo(collection = "companies", 
+                     db = "sample_training", 
+                     url = cadena_conexion, 
+                     options = opciones_conexion
+                   )
+
+glimpse(companies$find(limit = 1))
+```
+
+Ahora generemos la consulta requerida:
+
+```{r}
+# Pipeline de agregación
+pipeline04 <- '[
+  { "$match": { "category_code": "advertising", "founded_year": { "$gt": 1999 } } },
+  { "$group": { "_id": "$founded_year", "count": { "$sum": 1 } } },
+  { "$sort": { "_id": 1 } }
+]'
+
+# Ejecutar la agregación
+companies_year <- companies$aggregate(pipeline04) %>% 
+  as_tibble() %>% 
+  rename(year = `_id`)
+
+companies_year %>% 
+  gt()
+```
+
+Ya podemos dibujar el gráfico de líneas solicitado.
+
+```{r}
+companies_year %>% 
+  mutate(year = make_date(year)) %>% 
+  ggplot(aes(year, count)) + 
+  geom_line(linewidth = 1, color = "orange") + 
+  geom_point(color = "orange",
+             size = 3) + 
+  theme_light() + 
+  easy_labs(title = "Número de empresas fundadas por año", 
+            subtitle = "Base de datos: companies"
+            ) + 
+  easy_plot_title_size(size = 18) + 
+  easy_plot_subtitle_size(size = 14) + 
+  easy_remove_legend() + 
+  easy_remove_gridlines() +
+  easy_remove_axes(which = "both", 
+                   what = "title"
+                   ) + 
+  easy_remove_y_axis(what = c("ticks", 
+                              "text"
+                              )
+                     ) + 
+  easy_x_axis_labels_size(size = 10) + 
+  easy_change_text(which = "plot.title", 
+                   what = "face", 
+                   to = "bold"
+                   ) + 
+  scale_x_date(date_breaks = "1 year",
+               date_labels = "%Y"
+               ) + 
+  theme(axis.ticks.length = unit(0.10, "cm"), 
+        axis.ticks = element_line(color = "black")
+        ) +
+  geom_text(aes(label = count), 
+           color = "black", 
+           vjust = -0.5,
+           hjust = 1.5,
+           size = 3.4
+           )
+```
